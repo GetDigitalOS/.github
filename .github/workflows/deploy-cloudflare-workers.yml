@@ -1,0 +1,67 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: "Build command (e.g., npx opennextjs-cloudflare build)"
+        required: false
+        default: "npx opennextjs-cloudflare build"
+        type: string
+      node-version:
+        description: "Node.js version"
+        required: false
+        default: "22"
+        type: string
+      package-manager:
+        description: "Package manager: npm or pnpm"
+        required: false
+        default: "npm"
+        type: string
+      pnpm-version:
+        description: "pnpm version (only used when package-manager is pnpm)"
+        required: false
+        default: "10"
+        type: string
+      wrangler-command:
+        description: "Wrangler deploy command"
+        required: false
+        default: "deploy"
+        type: string
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+
+      - name: Install dependencies
+        run: ${{ inputs.package-manager == 'pnpm' && 'pnpm install --frozen-lockfile' || 'npm ci' }}
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: ${{ inputs.wrangler-command }}

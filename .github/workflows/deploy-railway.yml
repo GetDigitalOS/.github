@@ -1,0 +1,75 @@
+name: Deploy to Railway
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Railway service name"
+        required: true
+        type: string
+      node-version:
+        description: "Node.js version"
+        required: false
+        default: "22"
+        type: string
+      package-manager:
+        description: "Package manager: npm or pnpm"
+        required: false
+        default: "npm"
+        type: string
+      pnpm-version:
+        description: "pnpm version (only used when package-manager is pnpm)"
+        required: false
+        default: "10"
+        type: string
+      run-tests:
+        description: "Run tests before deploy"
+        required: false
+        default: true
+        type: boolean
+      test-command:
+        description: "Test command"
+        required: false
+        default: "npm test"
+        type: string
+    secrets:
+      RAILWAY_TOKEN:
+        required: true
+
+jobs:
+  test:
+    if: inputs.run-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+
+      - name: Install dependencies
+        run: ${{ inputs.package-manager == 'pnpm' && 'pnpm install --frozen-lockfile' || 'npm ci' }}
+
+      - name: Run tests
+        run: ${{ inputs.test-command }}
+
+  deploy:
+    needs: [test]
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy to Railway
+        run: railway up --service ${{ inputs.service-name }} --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
