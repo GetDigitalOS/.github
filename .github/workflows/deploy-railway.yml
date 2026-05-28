@@ -7,6 +7,16 @@ on:
         description: "Railway service name"
         required: true
         type: string
+      project-id:
+        description: "Railway project ID. Set this to deploy with a workspace-scoped RAILWAY_TOKEN; leave empty to use a project-scoped token (legacy)."
+        required: false
+        default: ""
+        type: string
+      environment:
+        description: "Railway environment (only used when project-id is set)"
+        required: false
+        default: "production"
+        type: string
       node-version:
         description: "Node.js version"
         required: false
@@ -70,6 +80,11 @@ jobs:
         run: npm install -g @railway/cli
 
       - name: Deploy to Railway
-        run: railway up --service ${{ inputs.service-name }} --detach
+        run: |
+          if [ -n "${{ inputs.project-id }}" ]; then
+            railway up --project "${{ inputs.project-id }}" --service "${{ inputs.service-name }}" --environment "${{ inputs.environment }}" --detach
+          else
+            railway up --service "${{ inputs.service-name }}" --detach
+          fi
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
