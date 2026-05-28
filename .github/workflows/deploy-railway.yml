@@ -82,9 +82,11 @@ jobs:
       - name: Deploy to Railway
         run: |
           if [ -n "${{ inputs.project-id }}" ]; then
+            export RAILWAY_API_TOKEN="$DEPLOY_TOKEN"
             railway up --project "${{ inputs.project-id }}" --service "${{ inputs.service-name }}" --environment "${{ inputs.environment }}" --detach
           else
+            export RAILWAY_TOKEN="$DEPLOY_TOKEN"
             railway up --service "${{ inputs.service-name }}" --detach
           fi
         env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          DEPLOY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
