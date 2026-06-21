@@ -49,7 +49,7 @@ on:
 jobs:
   test:
     if: inputs.run-tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
 
@@ -72,9 +72,13 @@ jobs:
   deploy:
     needs: [test]
     if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
 
       - name: Install Railway CLI
         run: npm install -g @railway/cli
