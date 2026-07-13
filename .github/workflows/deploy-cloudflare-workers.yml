@@ -42,10 +42,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # pnpm/action-setup throws "Multiple versions of pnpm specified" when the `version`
+      # input AND package.json's `packageManager` field are both set and disagree — e.g.
+      # `pnpm@10.29.3` vs this workflow's default input of "10". That killed the job before
+      # install, so the deploy step never ran, on every fleet repo that pins packageManager
+      # (conduit, cornerstone, hea-partner, hea-fulfillment, aws-operations, yourfds).
+      #
+      # packageManager is the exact pin and must win. But the action ALSO errors ("No pnpm
+      # version is specified") when neither is given, and several fleet repos have no
+      # packageManager field, so `version` cannot simply be dropped. Pass it only when the
+      # repo does not pin one: an empty `version` makes the action read packageManager.
+      - name: Resolve pnpm version source
+        if: inputs.package-manager == 'pnpm'
+        id: pnpm-src
+        shell: bash
+        run: |
+          if grep -qE '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@' package.json 2>/dev/null; then
+            echo "version=" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.pnpm-version }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: pnpm/action-setup@v4
         if: inputs.package-manager == 'pnpm'
         with:
-          version: ${{ inputs.pnpm-version }}
+          version: ${{ steps.pnpm-src.outputs.version }}
 
       - uses: actions/setup-node@v4
         with:
