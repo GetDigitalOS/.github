@@ -48,9 +48,30 @@ on:
         default: true
         type: boolean
       deploy-timeout-minutes:
-        description: "How long to wait for the deployment to become healthy before failing"
+        description: "How long to wait for the deployment to reach a terminal state before failing as unverified"
         required: false
         default: 15
+        type: number
+
+      # ── Layer 2: deployed-artifact provenance (OPT-IN) ──
+      #
+      # Only for projects that expose a build-identity endpoint. Leave empty and
+      # the workflow still fixes the outcome binding (Layer 1) for everyone else —
+      # this must not pretend every project already publishes provenance.
+      verify-url:
+        description: "Layer 2 (optional): URL of a build-identity endpoint. Must return JSON {buildSha, identified}. Empty = skip provenance verification."
+        required: false
+        default: ""
+        type: string
+      verify-expected-sha:
+        description: "Layer 2: the commit SHA that SHOULD be running. Defaults to the SHA that triggered this run."
+        required: false
+        default: ""
+        type: string
+      verify-timeout-seconds:
+        description: "Layer 2: how long to let the new build replace the old one at verify-url before failing"
+        required: false
+        default: 180
         type: number
     secrets:
       RAILWAY_TOKEN:
@@ -116,24 +137,41 @@ jobs:
       - name: Install Railway CLI
         run: npm install -g @railway/cli
 
-      # Deploy, then WAIT for the deployment to actually become healthy.
+      # ─────────────────────────────────────────────────────────────────────────
+      # LAYER 1 — Authoritative Railway outcome binding.
       #
-      # This used to be `railway up --detach`, which returns as soon as the upload succeeds and
-      # never looks at the outcome — so the job went green even when the deploy then failed.
-      # That is not hypothetical: liveintentionally's dashboard build failed on EVERY deploy
-      # from 2026-07-05 to 07-12, and every one of those runs was reported successful. The
-      # service served a stale image for a week and nothing surfaced it.
+      # The job's conclusion must correspond to DEPLOYMENT TRUTH. It has failed to
+      # in both directions, and each direction had a different cause:
       #
-      # Two distinct failures have to be caught, and they fail at different stages:
-      #   1. BUILD failure   — `--ci` streams build logs and waits for the build.
-      #   2. RUNTIME crash   — the image builds fine but the container dies on boot (typically a
-      #                        missing required env var). Railway marks this CRASHED *after* the
-      #                        build succeeds, so waiting for the build alone is not enough.
-      # Hence: build wait + poll to a terminal deployment state.
-      - name: Deploy to Railway
-        timeout-minutes: ${{ inputs.deploy-timeout-minutes }}
+      #   GREEN WHEN IT FAILED. `railway up --detach` returned on upload and never
+      #   looked at the outcome. liveintentionally's dashboard build failed on EVERY
+      #   deploy 2026-07-05..07-12; all runs reported success; the service served a
+      #   stale image for a week. Fixed earlier by polling to a terminal state.
+      #
+      #   RED WHEN IT SHIPPED. audit-runner run 29258866994 (2026-07-13): `railway up
+      #   --ci` uploaded, Railway built and started deployment 60c8bd86, and then the
+      #   CLI hit "Failed to stream build logs" and exited 1. Under `set -e` the script
+      #   died there and NEVER REACHED THE POLL. The job went red while the deployment
+      #   went live — and the poll, the one thing that knew the truth, was unreachable
+      #   precisely because the CLI stumbled.
+      #
+      # THE RULE THIS ENCODES:
+      #   The CLI is a TRANSPORT. Railway's deployment state is the AUTHORITY.
+      #   A non-zero exit from `railway up` means "state unknown — go ask Railway."
+      #   It NEVER means "the deploy failed." Only Railway's terminal state decides.
+      #
+      # We still have to catch a genuine upload failure, which looks the same at the
+      # exit code and differs only in its consequence: no new deployment ever
+      # registers. So a non-zero exit is escalated to failure ONLY if no new
+      # deployment appears within a grace window.
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Deploy to Railway (authoritative outcome)
+        id: deploy
+        # Deliberately NOT `-e`: the whole point is to survive the CLI's exit code
+        # and let Railway's state decide. `-u` and `-o pipefail` stay.
+        shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # $ARGS is intentionally unquoted below: it is a flag list that must word-split.
           # shellcheck disable=SC2086
 
@@ -145,33 +183,71 @@ jobs:
             ARGS="--service ${{ inputs.service-name }}"
           fi
 
+          # Reads a field off the newest deployment. `$1` is a JS expression against
+          # the deployment object, so nested reads work (e.g. `meta?.imageDigest`).
           latest_field() {
-            # $1 = field name. Reads the newest deployment via JSON; no jq dependency.
             railway deployment list $ARGS --limit 1 --json 2>/dev/null \
-              | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d)[0]?.$1 ?? '')}catch{console.log('')}})"
+              | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const x=JSON.parse(d)[0];console.log((x&&(x.$1))??'')}catch{console.log('')}})"
           }
 
-          # Remember the deployment that is current BEFORE we deploy. Without this, the poll
-          # below could read the PREVIOUS deployment's SUCCESS and pass while ours is still
-          # building — exactly the false-green this change exists to remove.
+          emit() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+          finish() {  # $1=outcome $2=exit
+            emit outcome "$1"
+            emit deployment-id "${ID:-}"
+            emit image-digest "${DIGEST:-}"
+            emit final-state "${STATUS:-unknown}"
+            echo "── deploy summary ──────────────────────────────"
+            echo "  service        : ${{ inputs.service-name }}"
+            echo "  deployment id  : ${ID:-none}"
+            echo "  image digest   : ${DIGEST:-unavailable}"
+            echo "  final state    : ${STATUS:-unknown}"
+            echo "  outcome        : $1"
+            echo "────────────────────────────────────────────────"
+            exit "$2"
+          }
+
+          # Remember the deployment that is current BEFORE we deploy. Without this the
+          # poll could read the PREVIOUS deployment's SUCCESS and pass while ours is
+          # still building — a false green of exactly the kind this exists to remove.
           PREV_ID="$(latest_field id)"
           echo "previous deployment: ${PREV_ID:-none}"
 
           railway up $ARGS --ci
+          UP_EXIT=$?
+
+          if [ "$UP_EXIT" -ne 0 ]; then
+            echo "::warning::\`railway up\` exited $UP_EXIT. This is NOT authoritative — it conflates a"
+            echo "::warning::failed deploy with a failed LOG STREAM. Asking Railway what actually happened."
+          fi
 
           if [ "${{ inputs.wait-for-deploy }}" != "true" ]; then
             echo "::warning::wait-for-deploy is false — not verifying that this deploy went live."
-            exit 0
+            ID="$(latest_field id)"; STATUS="not-verified"
+            finish fire-and-forget 0
           fi
 
-          echo "Waiting for the new deployment to reach a terminal state..."
+          # A genuine upload failure and a log-stream hiccup are indistinguishable by
+          # exit code; they differ in whether a NEW deployment ever registers.
+          REGISTER_GRACE=120
+          DEADLINE=$(( SECONDS + ${{ inputs.deploy-timeout-minutes }} * 60 ))
+          REGISTER_BY=$(( SECONDS + REGISTER_GRACE ))
 
+          echo "Waiting for the new deployment to reach a terminal state..."
           while true; do
             ID="$(latest_field id)"
             STATUS="$(latest_field status)"
+            DIGEST="$(latest_field 'meta?.imageDigest')"
 
-            # Don't grade the deployment we replaced.
             if [ -z "$ID" ] || [ "$ID" = "$PREV_ID" ]; then
+              if [ "$SECONDS" -ge "$REGISTER_BY" ]; then
+                if [ "$UP_EXIT" -ne 0 ]; then
+                  echo "::error::UPLOAD FAILED — \`railway up\` exited $UP_EXIT and no new deployment"
+                  echo "::error::registered within ${REGISTER_GRACE}s. Nothing was handed to Railway."
+                  STATUS="none"; finish upload-failed 1
+                fi
+                echo "::error::\`railway up\` succeeded but no new deployment registered within ${REGISTER_GRACE}s."
+                STATUS="none"; finish no-deployment-registered 1
+              fi
               echo "  waiting for the new deployment to register..."
               sleep 5
               continue
@@ -180,7 +256,7 @@ jobs:
             case "$STATUS" in
               SUCCESS)
                 echo "::notice::Railway deployment SUCCESS for ${{ inputs.service-name }} ($ID)"
-                exit 0
+                finish success 0
                 ;;
               FAILED|CRASHED)
                 echo "::error::Railway deployment $STATUS for ${{ inputs.service-name }} ($ID)"
@@ -190,13 +266,22 @@ jobs:
                 railway logs "$ID" --build $ARGS 2>/dev/null | tail -50 || true
                 echo "--- runtime logs (tail) ---"
                 railway logs "$ID" $ARGS 2>/dev/null | tail -50 || true
-                exit 1
+                finish deploy-failed 1
                 ;;
               REMOVED|SKIPPED)
                 echo "::error::Deployment ended as $STATUS — cannot confirm this deploy went live."
-                exit 1
+                finish deploy-removed 1
                 ;;
               *)
+                if [ "$SECONDS" -ge "$DEADLINE" ]; then
+                  # UNVERIFIED, not "failed". The deployment may well be fine — we simply
+                  # ran out of patience, and saying "failed" would be a claim we cannot
+                  # support. Naming it precisely is the whole point of this workflow.
+                  echo "::error::VERIFICATION TIMEOUT after ${{ inputs.deploy-timeout-minutes }}m."
+                  echo "::error::Deployment $ID is still '$STATUS'. This deploy is UNVERIFIED —"
+                  echo "::error::it may yet succeed. Check Railway before assuming it failed."
+                  finish verification-timeout 1
+                fi
                 echo "  status=$STATUS ..."
                 sleep 10
                 ;;
@@ -204,3 +289,78 @@ jobs:
           done
         env:
           DEPLOY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # LAYER 2 — Deployed-artifact provenance (opt-in).
+      #
+      # Layer 1 proves RAILWAY thinks the deployment succeeded. It does not prove
+      # WHICH CODE is running: Railway deploys here via a `railway up` CLI upload,
+      # not a repo-linked build, so Railway records an image digest and NO commit.
+      # Without this layer, "what is deployed?" can only be inferred from timing.
+      #
+      # Contract (opt in by setting verify-url):
+      #   GET <verify-url> -> {"buildSha": "<full sha>", "identified": true}
+      #
+      # We COMPARE the SHA we intended to ship against the SHA the service reports.
+      # Confirming that both values merely exist proves nothing.
+      #
+      # `identified: false` / `buildSha: "unknown"` is a FAILURE, never a pass — it
+      # is the artifact saying it cannot identify itself, and treating that as OK
+      # would let "unknown" silently satisfy the gate it exists to trip.
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Verify the deployed artifact reports the expected commit
+        if: inputs.verify-url != ''
+        shell: bash
+        env:
+          VERIFY_URL: ${{ inputs.verify-url }}
+          EXPECTED_SHA: ${{ inputs.verify-expected-sha != '' && inputs.verify-expected-sha || github.sha }}
+          TIMEOUT_S: ${{ inputs.verify-timeout-seconds }}
+        run: |
+          set -uo pipefail
+
+          echo "expected commit : $EXPECTED_SHA"
+          echo "verifying at    : $VERIFY_URL"
+
+          DEADLINE=$(( SECONDS + TIMEOUT_S ))
+          LAST=""
+
+          # Railway can report SUCCESS a moment before the new container is the one
+          # answering, so poll rather than sampling once — a single read can catch
+          # the OLD build still serving and report a mismatch that is really a race.
+          while true; do
+            BODY="$(curl -fsS --max-time 10 -H 'Cache-Control: no-cache' "$VERIFY_URL" 2>/dev/null)"
+
+            if [ -n "$BODY" ]; then
+              RUNNING="$(node -e "try{const j=JSON.parse(process.argv[1]);console.log(j.buildSha??'')}catch{console.log('')}" "$BODY")"
+              IDENT="$(node -e "try{const j=JSON.parse(process.argv[1]);console.log(j.identified===true?'true':'false')}catch{console.log('false')}" "$BODY")"
+              LAST="$RUNNING"
+
+              if [ "$IDENT" = "true" ] && [ "$RUNNING" = "$EXPECTED_SHA" ]; then
+                echo "::notice::PROVENANCE VERIFIED — ${{ inputs.service-name }} is running $EXPECTED_SHA"
+                exit 0
+              fi
+
+              if [ "$IDENT" != "true" ]; then
+                echo "::error::The deployed artifact CANNOT IDENTIFY ITSELF (identified=false, buildSha='${RUNNING:-unknown}')."
+                echo "::error::This is a failure, not a pass. The image was built without a commit stamp,"
+                echo "::error::so no deploy of it can ever be verified. Check the Dockerfile's GIT_SHA build arg."
+                exit 1
+              fi
+            fi
+
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              if [ -z "$BODY" ]; then
+                echo "::error::No response from $VERIFY_URL within ${TIMEOUT_S}s."
+                echo "::error::Either the endpoint does not exist, or the service is not serving."
+              else
+                echo "::error::REVISION MISMATCH — expected $EXPECTED_SHA, but the running service"
+                echo "::error::reports ${LAST:-<none>} after ${TIMEOUT_S}s."
+                echo "::error::Railway called the deployment successful, yet the OLD code is still serving."
+                echo "::error::This is exactly the failure Layer 1 alone cannot see."
+              fi
+              exit 1
+            fi
+
+            echo "  running=${LAST:-<no response>} (want $EXPECTED_SHA) ..."
+            sleep 5
+          done
