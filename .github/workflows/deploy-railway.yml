@@ -42,6 +42,16 @@ on:
         required: false
         default: "npm test"
         type: string
+      wait-for-deploy:
+        description: "Wait for the Railway deployment to reach a terminal state and fail the job if it is not SUCCESS. Set false only for fire-and-forget deploys."
+        required: false
+        default: true
+        type: boolean
+      deploy-timeout-minutes:
+        description: "How long to wait for the deployment to become healthy before failing"
+        required: false
+        default: 15
+        type: number
     secrets:
       RAILWAY_TOKEN:
         required: true
@@ -83,14 +93,91 @@ jobs:
       - name: Install Railway CLI
         run: npm install -g @railway/cli
 
+      # Deploy, then WAIT for the deployment to actually become healthy.
+      #
+      # This used to be `railway up --detach`, which returns as soon as the upload succeeds and
+      # never looks at the outcome — so the job went green even when the deploy then failed.
+      # That is not hypothetical: liveintentionally's dashboard build failed on EVERY deploy
+      # from 2026-07-05 to 07-12, and every one of those runs was reported successful. The
+      # service served a stale image for a week and nothing surfaced it.
+      #
+      # Two distinct failures have to be caught, and they fail at different stages:
+      #   1. BUILD failure   — `--ci` streams build logs and waits for the build.
+      #   2. RUNTIME crash   — the image builds fine but the container dies on boot (typically a
+      #                        missing required env var). Railway marks this CRASHED *after* the
+      #                        build succeeds, so waiting for the build alone is not enough.
+      # Hence: build wait + poll to a terminal deployment state.
       - name: Deploy to Railway
+        timeout-minutes: ${{ inputs.deploy-timeout-minutes }}
         run: |
+          set -euo pipefail
+          # $ARGS is intentionally unquoted below: it is a flag list that must word-split.
+          # shellcheck disable=SC2086
+
           if [ -n "${{ inputs.project-id }}" ]; then
             export RAILWAY_API_TOKEN="$DEPLOY_TOKEN"
-            railway up --project "${{ inputs.project-id }}" --service "${{ inputs.service-name }}" --environment "${{ inputs.environment }}" --detach
+            ARGS="--project ${{ inputs.project-id }} --service ${{ inputs.service-name }} --environment ${{ inputs.environment }}"
           else
             export RAILWAY_TOKEN="$DEPLOY_TOKEN"
-            railway up --service "${{ inputs.service-name }}" --detach
+            ARGS="--service ${{ inputs.service-name }}"
           fi
+
+          latest_field() {
+            # $1 = field name. Reads the newest deployment via JSON; no jq dependency.
+            railway deployment list $ARGS --limit 1 --json 2>/dev/null \
+              | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d)[0]?.$1 ?? '')}catch{console.log('')}})"
+          }
+
+          # Remember the deployment that is current BEFORE we deploy. Without this, the poll
+          # below could read the PREVIOUS deployment's SUCCESS and pass while ours is still
+          # building — exactly the false-green this change exists to remove.
+          PREV_ID="$(latest_field id)"
+          echo "previous deployment: ${PREV_ID:-none}"
+
+          railway up $ARGS --ci
+
+          if [ "${{ inputs.wait-for-deploy }}" != "true" ]; then
+            echo "::warning::wait-for-deploy is false — not verifying that this deploy went live."
+            exit 0
+          fi
+
+          echo "Waiting for the new deployment to reach a terminal state..."
+
+          while true; do
+            ID="$(latest_field id)"
+            STATUS="$(latest_field status)"
+
+            # Don't grade the deployment we replaced.
+            if [ -z "$ID" ] || [ "$ID" = "$PREV_ID" ]; then
+              echo "  waiting for the new deployment to register..."
+              sleep 5
+              continue
+            fi
+
+            case "$STATUS" in
+              SUCCESS)
+                echo "::notice::Railway deployment SUCCESS for ${{ inputs.service-name }} ($ID)"
+                exit 0
+                ;;
+              FAILED|CRASHED)
+                echo "::error::Railway deployment $STATUS for ${{ inputs.service-name }} ($ID)"
+                echo "CRASHED usually means the image built but the container died on boot —"
+                echo "most often a missing or invalid required environment variable."
+                echo "--- build logs (tail) ---"
+                railway logs "$ID" --build $ARGS 2>/dev/null | tail -50 || true
+                echo "--- runtime logs (tail) ---"
+                railway logs "$ID" $ARGS 2>/dev/null | tail -50 || true
+                exit 1
+                ;;
+              REMOVED|SKIPPED)
+                echo "::error::Deployment ended as $STATUS — cannot confirm this deploy went live."
+                exit 1
+                ;;
+              *)
+                echo "  status=$STATUS ..."
+                sleep 10
+                ;;
+            esac
+          done
         env:
           DEPLOY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
