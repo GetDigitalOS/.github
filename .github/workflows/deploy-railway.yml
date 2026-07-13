@@ -137,6 +137,29 @@ jobs:
       - name: Install Railway CLI
         run: npm install -g @railway/cli
 
+      # Stamp the commit into the SOURCE, because it cannot be stamped into the BUILD.
+      #
+      # `railway up` uploads this directory and Railway builds the image on its own
+      # builders. The CLI has no `--build-arg`, so a Dockerfile `ARG GIT_SHA` can
+      # never be supplied and would silently keep its default forever — which is
+      # exactly the false-provenance this whole change exists to prevent. (Railway
+      # does expose service *variables* as build args, but keeping one current would
+      # mean writing a variable on every deploy, and a variable write itself triggers
+      # a redeploy. That is a loop, not a mechanism.)
+      #
+      # So: write the SHA into a file that the upload carries. A project opts in by
+      # COPYing `.build-sha` in its Dockerfile and reading it at runtime. Projects
+      # that do not are unaffected — the file is simply ignored.
+      #
+      # Harmless when unused; load-bearing when used.
+      - name: Stamp build provenance into the upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ github.sha }}" > .build-sha
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .build-time
+          echo "stamped .build-sha = $(cat .build-sha)"
+
       # ─────────────────────────────────────────────────────────────────────────
       # LAYER 1 — Authoritative Railway outcome binding.
       #
