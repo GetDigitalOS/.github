@@ -50,7 +50,20 @@ concurrency:
 jobs:
   outcome-binding:
     name: R-A outcome binding + provenance polling
-    runs-on: [self-hosted, Linux, X64]
+    # GITHUB-HOSTED, NOT SELF-HOSTED — and this is a security boundary, not a preference.
+    #
+    # This repo is PUBLIC (all 21 callers are private). The org runner group sets
+    # allows_public_repositories: false, which is why the first attempt at this job
+    # queued forever — and that default is CORRECT. Self-hosted runners on a public
+    # repo mean anyone can open a fork PR and execute arbitrary code on the box those
+    # runners live on, alongside every other repo checked out there. The fix is to run
+    # somewhere disposable, NOT to widen the runner group.
+    #
+    # An ephemeral hosted VM is the right home anyway: the suite has zero dependencies
+    # (node + bash + stubs on PATH), touches no network, and needs no secrets. Hosted
+    # minutes are free on public repos, so a fork PR running it costs nothing and can
+    # reach nothing.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
