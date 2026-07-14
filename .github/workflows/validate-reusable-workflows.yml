@@ -1,0 +1,84 @@
+name: Validate reusable workflows
+
+# VALIDATION ONLY. This job cannot deploy anything, and that is a property of its
+# construction, not of its good intentions:
+#
+#   * no `secrets:` block and no secret is referenced anywhere below — the Railway
+#     token is never in scope, so `railway up` could not authenticate even if a
+#     future edit tried to call it;
+#   * `permissions: contents: read` — no write scope to this repo, its packages,
+#     its deployments, or anything else;
+#   * it never `uses:` a reusable deploy workflow — it runs a test suite;
+#   * the suite itself talks to STUBS on PATH, never the network.
+#
+# Why it exists: deploy-railway.yml is inherited by 21 caller repos. A regression in
+# it is a fleet-wide production defect — that is exactly how the authoritative-outcome
+# binding shipped broken and stayed broken (audit-runner run 29292062216, cornerstone
+# run 29261354143: both reported RED over deployments Railway recorded as SUCCESS).
+# A test suite that only runs when someone remembers to run it is documentation, not a
+# control. This makes it a control.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/deploy-railway.yml"
+      - ".github/workflows/deploy-cloudflare-pages.yml"
+      - ".github/workflows/deploy-cloudflare-workers.yml"
+      - ".github/workflows/lighthouse-ci.yml"
+      - ".github/workflows/validate-reusable-workflows.yml"
+      - "tests/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/deploy-railway.yml"
+      - ".github/workflows/deploy-cloudflare-pages.yml"
+      - ".github/workflows/deploy-cloudflare-workers.yml"
+      - ".github/workflows/lighthouse-ci.yml"
+      - ".github/workflows/validate-reusable-workflows.yml"
+      - "tests/**"
+
+# Read-only. Nothing here may write to the repo, and no deployment scope is granted.
+permissions:
+  contents: read
+
+# A superseded validation run has no value — cancel it. (Safe to cancel precisely
+# BECAUSE this job deploys nothing: there is no half-finished side effect to strand.)
+concurrency:
+  group: validate-reusable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  outcome-binding:
+    name: R-A outcome binding + provenance polling
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The suite has ZERO dependencies — no install step, so no lockfile, no
+      # registry fetch, and nothing to supply-chain. `node --test` is the runner.
+      #
+      # It EXTRACTS the real `run:` blocks from the real deploy-railway.yml and
+      # executes them under GitHub's real shell invocation
+      # (bash --noprofile --norc -eo pipefail), against stubbed `railway`/`curl` on
+      # PATH. Nothing is transcribed, so a regression in the shipped YAML fails here
+      # rather than in production.
+      #
+      # It asserts the authoritative-outcome path — a non-zero `railway up` must
+      # reach the UP_EXIT handler, warn, poll Railway, and go GREEN on an
+      # authoritative SUCCESS — plus the negative controls (no new deployment =>
+      # fail; Railway terminal failure => fail) and the Layer-2 provenance poll
+      # (rides out a refused connection; identified:false FAILS; a stale SHA is a
+      # REVISION MISMATCH; never-answered is a different fact).
+      #
+      # It also carries a harness-integrity test: if THAT one ever passes, the
+      # harness is not reproducing GitHub's shell and every other assertion is
+      # vacuous.
+      - name: Run the reusable-workflow regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test tests/deploy-railway-outcome-binding.test.mjs
