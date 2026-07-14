@@ -6,9 +6,9 @@
 // the action was written to end (aws-operations: three weeks of green CI over a workspace
 // that could not be checked out — see actions/runner-workspace-guard/action.yml).
 //
-// So the tests do not transcribe the shell. They EXTRACT the real `run:` blocks from the
-// shipped action.yml and execute them under GitHub's exact shell invocation, against a
-// real filesystem with real root-owned files.
+// So the tests do not transcribe the shell. They execute the SHIPPED preflight.sh and
+// restore.sh under GitHub's exact shell invocation, against a real filesystem with real
+// root-owned files. The bytes under test are the bytes that run in CI.
 //
 // Every assertion is a MUTATION check: we never ask "did chown exit 0", we re-stat the
 // files. A command that reports success is not evidence that the filesystem changed —
@@ -23,17 +23,19 @@
 
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, statSync, existsSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GITHUB_BASH, extractRunScript } from './lib/workflow-step.mjs';
+import { GITHUB_BASH } from './lib/workflow-step.mjs';
 
-const ACTION = fileURLToPath(new URL('../actions/runner-workspace-guard/action.yml', import.meta.url));
-
-const PREFLIGHT = extractRunScript(ACTION, 'Runner workspace preflight');
-const RESTORE = extractRunScript(ACTION, 'Runner workspace restore');
+// The shipped artifacts themselves. The guard's logic lives in these two files (the action's
+// JS entry points only decide WHEN to invoke them), so the suite executes them directly under
+// GitHub's exact shell invocation. Nothing is transcribed and nothing is extracted: the bytes
+// under test are the bytes that run in CI.
+const PREFLIGHT = fileURLToPath(new URL('../actions/runner-workspace-guard/preflight.sh', import.meta.url));
+const RESTORE = fileURLToPath(new URL('../actions/runner-workspace-guard/restore.sh', import.meta.url));
 
 const AM_ROOT = process.getuid() === 0;
 
@@ -71,12 +73,8 @@ function sudoExec(argv) {
   return r;
 }
 
-/** Execute an extracted `run:` block under GitHub's exact shell invocation. */
-function runStep(script, { workspace, extraPaths = '', asRoot }) {
-  const dir = mkdtempSync(join(tmpdir(), 'guard-step-'));
-  const scriptPath = join(dir, 'step.sh');
-  writeFileSync(scriptPath, script);
-  sudoExec(['chmod', '0777', dir]);
+/** Execute one of the shipped scripts under GitHub's exact shell invocation. */
+function runStep(scriptPath, { workspace, extraPaths = '', asRoot }) {
 
   const env = {
     ...process.env,
@@ -285,13 +283,10 @@ test('an EMPTY owner-uid must FAIL, not silently no-op into a false PASS', () =>
   //   * `find -uid ""` errors out, and an error-tolerant count reads that as ZERO offenders.
   // A guard that reports success over a workspace it never touched is the exact defect class
   // it was built to eliminate. Absent input is not safe input.
-  for (const script of [PREFLIGHT, RESTORE]) {
+  for (const scriptPath of [PREFLIGHT, RESTORE]) {
     const ws = cleanWorkspace();
     poison(ws);
 
-    const dir = mkdtempSync(join(tmpdir(), 'guard-noop-'));
-    const scriptPath = join(dir, 'step.sh');
-    writeFileSync(scriptPath, script);
     const res = spawnSync(
       AM_ROOT ? 'bash' : 'sudo',
       AM_ROOT
@@ -318,12 +313,14 @@ test('an EMPTY owner-uid must FAIL, not silently no-op into a false PASS', () =>
 test('HARNESS INTEGRITY: the suite executes the SHIPPED action, and can observe a real failure', () => {
   // If this fails, the extractor is not reading the real action.yml and every other
   // assertion above is vacuous — passing over a script nobody ships.
-  assert.match(PREFLIGHT, /preflight PASSED/, 'extracted preflight does not look like the shipped script');
-  assert.match(RESTORE, /chown -R/, 'extracted restore does not look like the shipped script');
+  const preflightSrc = readFileSync(PREFLIGHT, 'utf8');
+  const restoreSrc = readFileSync(RESTORE, 'utf8');
+  assert.match(preflightSrc, /preflight PASSED/, 'preflight.sh does not look like the shipped script');
+  assert.match(restoreSrc, /chown -R/, 'restore.sh does not look like the shipped script');
   assert.doesNotMatch(
-    PREFLIGHT + RESTORE,
+    preflightSrc + restoreSrc,
     /\$\{\{/,
-    'run: blocks must be pure bash (inputs arrive via env:) so they are tested exactly as shipped',
+    'the scripts must be pure bash (inputs arrive via env:) so they are tested exactly as shipped',
   );
 
   // And prove the harness can actually observe a failure. A suite that cannot fail proves
