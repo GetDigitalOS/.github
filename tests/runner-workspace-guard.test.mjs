@@ -136,6 +136,20 @@ function poison(p) {
   assert.equal(statSync(p).uid, 0, 'precondition: path must actually be root-owned');
 }
 
+/**
+ * stat a path WITH privilege.
+ *
+ * Needed because a poisoned workspace is genuinely unreadable to us: mkdtemp creates the
+ * root dir 0700, and once it is chowned to root the unprivileged test process cannot even
+ * traverse into it — statSync on anything *inside* raises EACCES. That is the real
+ * behaviour of the bug, so the test must not pretend otherwise; it must simply look at the
+ * filesystem the way root can. (Running the suite as root hides this entirely, which is why
+ * it only surfaced on ubuntu-latest. The unprivileged environment is the honest one.)
+ */
+function statAsRoot(p) {
+  return sudoExec(['stat', '-c', '%u:%g', p]).stdout.trim();
+}
+
 // ---------------------------------------------------------------------------
 // PREFLIGHT
 // ---------------------------------------------------------------------------
@@ -207,14 +221,18 @@ test('preflight reports a stale git lock as a WARNING and never deletes it', () 
 test('restore (as root) chowns a poisoned workspace back — PROVEN BY RE-STATTING, not by exit code', () => {
   const ws = cleanWorkspace();
   poison(ws);
-  assert.equal(statSync(join(ws, '.git', 'index')).uid, 0, 'precondition: poisoned');
+  // Read the precondition with privilege: a poisoned 0700 root-owned workspace is, by
+  // construction, one we cannot descend into. That is the bug, not a test artefact.
+  assert.equal(statAsRoot(join(ws, '.git', 'index')), '0:0', 'precondition: poisoned');
 
   const { code, log } = runStep(RESTORE, { workspace: ws, asRoot: true });
 
   assert.equal(code, 0, log);
   assert.match(log, /restore PASSED/);
 
-  // The actual proof. Not "chown said ok" — the files changed owner on disk.
+  // The actual proof. Not "chown said ok" — the files changed owner on disk. And these
+  // statSync calls are deliberately UNPRIVILEGED: if the restore really worked, the
+  // ordinary runner user can now read the workspace again. That is the whole invariant.
   for (const p of [ws, join(ws, '.git'), join(ws, '.git', 'index'), join(ws, '.claude', 'agents')]) {
     assert.equal(statSync(p).uid, OWNER_UID, `not restored (uid): ${p}`);
     assert.equal(statSync(p).gid, OWNER_GID, `not restored (gid): ${p}`);
