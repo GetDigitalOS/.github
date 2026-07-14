@@ -70,9 +70,19 @@ inputs:
     default: '1000'
   extra-paths:
     description: >-
-      Optional newline- or comma-separated extra paths to guard/restore — e.g. a shared package
-      store a root container also writes, such as /__w/.pnpm-store. Missing paths are skipped,
-      not an error.
+      Newline- or comma-separated extra paths to restore. Missing paths are skipped, not an error.
+
+      A root container job writes MORE than its repository workspace. Two paths are bind-mounted
+      from the host and land root-owned on every run, and both belong here for any container job:
+
+        /__w/_temp        - the runner's scratch, and the container's HOME (_temp/_github_home).
+                            GitHub bind-mounts it in and the root container writes it. Not
+                            currently blocking (its entries are per-job and uniquely named), but
+                            it accumulates thousands of root-owned files, and a health check that
+                            reports a known-benign FAIL is a health check people learn to ignore.
+        /__w/.pnpm-store  - or whatever shared, CROSS-REPO package store the job populates. This
+                            one is a real latent hazard: the day a non-container job resolves the
+                            same store, it cannot write it.
     required: false
     default: ''
 
