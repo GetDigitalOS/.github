@@ -26,6 +26,7 @@ on:
       - ".github/workflows/deploy-cloudflare-workers.yml"
       - ".github/workflows/lighthouse-ci.yml"
       - ".github/workflows/validate-reusable-workflows.yml"
+      - "actions/**"
       - "tests/**"
   push:
     branches: [main]
@@ -35,6 +36,7 @@ on:
       - ".github/workflows/deploy-cloudflare-workers.yml"
       - ".github/workflows/lighthouse-ci.yml"
       - ".github/workflows/validate-reusable-workflows.yml"
+      - "actions/**"
       - "tests/**"
 
 # Read-only. Nothing here may write to the repo, and no deployment scope is granted.
@@ -95,3 +97,36 @@ jobs:
         run: |
           set -euo pipefail
           node --test tests/deploy-railway-outcome-binding.test.mjs
+
+  workspace-guard:
+    name: runner-workspace-guard ownership invariant
+    # ubuntu-latest for the same security reason as the job above (this repo is PUBLIC),
+    # and for one more: the suite needs to create REAL root-owned files to test against.
+    # A disposable hosted VM with passwordless sudo is exactly the right place to do that,
+    # and precisely the wrong thing to do on the self-hosted box whose workspaces are the
+    # thing under repair.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Extracts the real `run:` blocks out of actions/runner-workspace-guard/action.yml and
+      # executes them under GitHub's real shell invocation against a real filesystem with
+      # real root-owned files. Nothing is transcribed.
+      #
+      # It carries the two negative controls that matter:
+      #   * restore run as NON-root over root-owned files must FAIL — if it ever passes, the
+      #     guard is reporting success over a workspace it did not fix, which is the original
+      #     defect wearing a new hat;
+      #   * a directory that is correctly OWNED but not WRITABLE must still fail preflight —
+      #     "owned by me" is not the invariant checkout needs, "parent is writable" is.
+      # Plus a harness-integrity test: if that one ever passes, the suite is not executing the
+      # shipped action and every other assertion in it is vacuous.
+      - name: Run the runner-workspace-guard regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test tests/runner-workspace-guard.test.mjs
