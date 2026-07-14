@@ -89,10 +89,23 @@ function runStep(script, { workspace, extraPaths = '', asRoot }) {
   // Only the euid differs between these two. The shell OPTIONS stay exactly what GitHub
   // sets (--noprofile --norc -eo pipefail) in both cases — that is the point of reusing
   // GITHUB_BASH rather than inventing an invocation.
+  //
+  // The env is handed over via `sudo env KEY=VAL ...`, NOT `sudo -E`. sudo's env_reset
+  // policy silently dropped GUARD_UID/GUARD_GID under `-E` on ubuntu-latest, and an empty
+  // uid turns the action into a no-op that reports success (`chown ":" path` is a valid
+  // do-nothing; `find -uid ""` errors to a zero count). The suite caught it; the action now
+  // refuses an empty uid outright, and the harness no longer relies on sudo's goodwill.
+  const envArgs = Object.entries({
+    GITHUB_WORKSPACE: env.GITHUB_WORKSPACE,
+    GUARD_UID: env.GUARD_UID,
+    GUARD_GID: env.GUARD_GID,
+    GUARD_EXTRA_PATHS: env.GUARD_EXTRA_PATHS,
+  }).map(([k, v]) => `${k}=${v}`);
+
   let cmd, argv;
   if (asRoot) {
     if (AM_ROOT) { cmd = 'bash'; argv = [...GITHUB_BASH, scriptPath]; }
-    else { cmd = 'sudo'; argv = ['-E', 'bash', ...GITHUB_BASH, scriptPath]; }
+    else { cmd = 'sudo'; argv = ['env', ...envArgs, 'bash', ...GITHUB_BASH, scriptPath]; }
   } else {
     if (AM_ROOT) {
       cmd = 'setpriv';
@@ -241,6 +254,43 @@ test('restore tolerates an absent extra-path rather than failing the job', () =>
     asRoot: true,
   });
   assert.equal(code, 0, log);
+});
+
+// ---------------------------------------------------------------------------
+// THE NO-OP HOLE  (a real defect this suite found, in CI, in the guard itself)
+// ---------------------------------------------------------------------------
+
+test('an EMPTY owner-uid must FAIL, not silently no-op into a false PASS', () => {
+  // This is not a hypothetical. Under `sudo -E`, ubuntu-latest's env_reset dropped GUARD_UID,
+  // and with an empty uid the restore step became a no-op that printed "restore PASSED":
+  //   * `chown -R ":" <path>` is a VALID command that changes nothing and exits 0;
+  //   * `find -uid ""` errors out, and an error-tolerant count reads that as ZERO offenders.
+  // A guard that reports success over a workspace it never touched is the exact defect class
+  // it was built to eliminate. Absent input is not safe input.
+  for (const script of [PREFLIGHT, RESTORE]) {
+    const ws = cleanWorkspace();
+    poison(ws);
+
+    const dir = mkdtempSync(join(tmpdir(), 'guard-noop-'));
+    const scriptPath = join(dir, 'step.sh');
+    writeFileSync(scriptPath, script);
+    const res = spawnSync(
+      AM_ROOT ? 'bash' : 'sudo',
+      AM_ROOT
+        ? [...GITHUB_BASH, scriptPath]
+        : ['env', `GITHUB_WORKSPACE=${ws}`, 'GUARD_UID=', 'GUARD_GID=', 'GUARD_EXTRA_PATHS=', 'bash', ...GITHUB_BASH, scriptPath],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, GITHUB_WORKSPACE: ws, GUARD_UID: '', GUARD_GID: '', GUARD_EXTRA_PATHS: '' },
+      },
+    );
+    const log = `${res.stdout ?? ''}${res.stderr ?? ''}`;
+
+    assert.notEqual(res.status, 0, `an empty owner-uid must be refused outright.\n${log}`);
+    assert.match(log, /must be a non-empty NUMERIC uid/);
+    assert.doesNotMatch(log, /PASSED/, 'it must never print PASSED with no owner configured');
+    assert.equal(statSync(ws).uid, 0, 'and it must not have pretended to fix anything');
+  }
 });
 
 // ---------------------------------------------------------------------------

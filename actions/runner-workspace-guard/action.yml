@@ -70,6 +70,20 @@ runs:
         want_uid="$GUARD_UID"
         want_gid="$GUARD_GID"
 
+        # FAIL CLOSED ON A MISSING OWNER. Do not treat this as paranoia — an empty uid makes
+        # this whole guard a no-op that reports success:
+        #   * `chown -R ":" <path>` is VALID and does nothing, and exits 0;
+        #   * `find -uid ""` errors, and the error-tolerant count above then reads as ZERO
+        #     foreign-owned paths.
+        # Together that prints "PASSED" over a workspace it never touched. An absent input is
+        # not a safe input, and this exact hole was caught by the suite's own negative control.
+        case "$want_uid" in ''|*[!0-9]*)
+          echo "::error::runner-workspace-guard: owner-uid must be a non-empty NUMERIC uid (got '$want_uid'). Refusing to run: an empty owner silently turns this guard into a no-op that reports success."
+          exit 1;; esac
+        case "$want_gid" in ''|*[!0-9]*)
+          echo "::error::runner-workspace-guard: owner-gid must be a non-empty NUMERIC gid (got '$want_gid'). Refusing to run."
+          exit 1;; esac
+
         # Collect the paths to inspect. The workspace always; extra paths only if present.
         targets=()
         [ -e "${GITHUB_WORKSPACE:-}" ] && targets+=("$GITHUB_WORKSPACE")
@@ -186,6 +200,20 @@ runs:
 
         want_uid="$GUARD_UID"
         want_gid="$GUARD_GID"
+
+        # FAIL CLOSED ON A MISSING OWNER. Do not treat this as paranoia — an empty uid makes
+        # this whole guard a no-op that reports success:
+        #   * `chown -R ":" <path>` is VALID and does nothing, and exits 0;
+        #   * `find -uid ""` errors, and the error-tolerant count above then reads as ZERO
+        #     foreign-owned paths.
+        # Together that prints "PASSED" over a workspace it never touched. An absent input is
+        # not a safe input, and this exact hole was caught by the suite's own negative control.
+        case "$want_uid" in ''|*[!0-9]*)
+          echo "::error::runner-workspace-guard: owner-uid must be a non-empty NUMERIC uid (got '$want_uid'). Refusing to run: an empty owner silently turns this guard into a no-op that reports success."
+          exit 1;; esac
+        case "$want_gid" in ''|*[!0-9]*)
+          echo "::error::runner-workspace-guard: owner-gid must be a non-empty NUMERIC gid (got '$want_gid'). Refusing to run."
+          exit 1;; esac
 
         targets=()
         [ -e "${GITHUB_WORKSPACE:-}" ] && targets+=("$GITHUB_WORKSPACE")
