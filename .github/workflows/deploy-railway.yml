@@ -190,8 +190,29 @@ jobs:
       # ─────────────────────────────────────────────────────────────────────────
       - name: Deploy to Railway (authoritative outcome)
         id: deploy
-        # Deliberately NOT `-e`: the whole point is to survive the CLI's exit code
-        # and let Railway's state decide. `-u` and `-o pipefail` stay.
+        # ERREXIT IS ON HERE AND CANNOT BE TURNED OFF BY THE SCRIPT.
+        #
+        # `shell: bash` is not `/bin/bash script`. GitHub expands it to
+        #     bash --noprofile --norc -eo pipefail {0}
+        # so `-e` is set on the SHELL INVOCATION, before line 1 runs. An earlier
+        # version of this step carried `set -uo pipefail` under a comment claiming
+        # it was "deliberately not -e" — but `set -uo pipefail` only ADDS `-u` and
+        # `-o pipefail`. It never clears `-e`. The comment described an intent the
+        # shell did not implement, and the step died on the first non-zero command:
+        # audit-runner run 29292062216, where `railway up` uploaded fine, then its
+        # log-stream GraphQL call timed out and it exited 1. The shell died on that
+        # line — before UP_EXIT, before the warning, before the poll. The step whose
+        # entire job is to go ask Railway what really happened never asked, and the
+        # job went red over a deployment Railway had already marked SUCCESS.
+        #
+        # We keep `-e` (an unexpected failure SHOULD abort) and instead scope the
+        # exception to each command whose non-zero exit is INFORMATION, not failure:
+        #   * `railway up`      -> its exit code is a transport signal; see below.
+        #   * `latest_field`    -> a CLI/network hiccup while READING state must not
+        #                          be fatal; it returns "" and the callers handle "".
+        #                          (`-o pipefail` makes its pipeline fail if the CLI
+        #                          fails, so this needs the guard even though `node`
+        #                          itself always exits 0.)
         shell: bash
         run: |
           set -uo pipefail
@@ -208,8 +229,13 @@ jobs:
 
           # Reads a field off the newest deployment. `$1` is a JS expression against
           # the deployment object, so nested reads work (e.g. `meta?.imageDigest`).
+          #
+          # `|| true` is load-bearing under `-e` + `-o pipefail`: a transient CLI or
+          # network error here would otherwise kill the step from inside a command
+          # substitution — i.e. reading the state would fail the deploy. Absence of
+          # an answer is reported as "" and every caller already handles "".
           latest_field() {
-            railway deployment list $ARGS --limit 1 --json 2>/dev/null \
+            { railway deployment list $ARGS --limit 1 --json 2>/dev/null || true; } \
               | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const x=JSON.parse(d)[0];console.log((x&&(x.$1))??'')}catch{console.log('')}})"
           }
 
@@ -235,8 +261,12 @@ jobs:
           PREV_ID="$(latest_field id)"
           echo "previous deployment: ${PREV_ID:-none}"
 
-          railway up $ARGS --ci
-          UP_EXIT=$?
+          # Command-scoped errexit exception. `|| UP_EXIT=$?` both CAPTURES the exit
+          # code and marks the command as handled, so `-e` does not fire. Writing
+          # `railway up ...` on its own line and reading `$?` on the next CANNOT
+          # work under `-e`: the shell is already gone by then.
+          UP_EXIT=0
+          railway up $ARGS --ci || UP_EXIT=$?
 
           if [ "$UP_EXIT" -ne 0 ]; then
             echo "::warning::\`railway up\` exited $UP_EXIT. This is NOT authoritative — it conflates a"
@@ -350,8 +380,20 @@ jobs:
           # Railway can report SUCCESS a moment before the new container is the one
           # answering, so poll rather than sampling once — a single read can catch
           # the OLD build still serving and report a mismatch that is really a race.
+          #
+          # `|| true` is load-bearing, for the same reason as `latest_field` above:
+          # `-e` is ON (GitHub's `shell: bash` = `bash --noprofile --norc -eo pipefail`),
+          # and a failed command substitution in an assignment takes the assignment's
+          # exit status with it. Without the guard, the FIRST refused connection —
+          # exactly what a container swap produces, and exactly what this loop exists
+          # to ride out — would kill the step instantly, with none of the diagnostics
+          # below ever printing and no retry. The poll would not poll.
+          #
+          # An empty BODY is the "no answer yet" case and is handled: we fall through
+          # to the deadline check, which distinguishes "never answered" from
+          # "answered with the wrong SHA". That distinction is the point of the step.
           while true; do
-            BODY="$(curl -fsS --max-time 10 -H 'Cache-Control: no-cache' "$VERIFY_URL" 2>/dev/null)"
+            BODY="$(curl -fsS --max-time 10 -H 'Cache-Control: no-cache' "$VERIFY_URL" 2>/dev/null || true)"
 
             if [ -n "$BODY" ]; then
               RUNNING="$(node -e "try{const j=JSON.parse(process.argv[1]);console.log(j.buildSha??'')}catch{console.log('')}" "$BODY")"
